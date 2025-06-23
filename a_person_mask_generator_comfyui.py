@@ -64,6 +64,10 @@ class APersonMaskGenerator:
                 "hair_mask": false_widget,
                 "body_mask": false_widget,
                 "clothes_mask": false_widget,
+                "eyeglasses_mask": false_widget,
+                "hat_mask": false_widget,
+                "earrings_mask": false_widget,
+                "other_accessories_mask": false_widget,
                 "confidence": (
                     "FLOAT",
                     {"default": 0.40, "min": 0.01, "max": 1.0, "step": 0.01},
@@ -95,40 +99,89 @@ class APersonMaskGenerator:
 
     def get_bbox_for_mask(self, mask_image: Image):
         # Convert the image to grayscale
-        grayscale = mask_image.convert("L")
+        grayscale_image = mask_image.convert("L")
 
-        # Create a binary mask where non-black pixels are white (255)
-        mask_for_bbox = grayscale.point(lambda p: 255 if p > 0 else 0)
+        # Convert the PIL image to a NumPy array
+        image_array = np.array(grayscale_image)
 
-        # Get the bounding box of the non-black areas
-        bbox = mask_for_bbox.getbbox()
+        # Find contours in the binary image
+        contours, _ = cv2.findContours(
+            image_array, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
 
-        if bbox != None:
-            left = bbox[0]
-            upper = bbox[1]
-            right = bbox[2]
-            lower = bbox[3]
+        if contours:
+            # Find the bounding box of the largest contour (assuming it's the main subject)
+            largest_contour = max(contours, key=cv2.contourArea)
+            x, y, w, h = cv2.boundingRect(largest_contour)
 
-            bbox_width = right - left
-            bbox_height = lower - upper
+            return (x, y, x + w, y + h)
 
-            # expand the box by 20% in each direction if possible
-            bbox_padding_x = round(bbox_width * 0.2)
-            bbox_padding_y = round(bbox_height * 0.2)
+        return None
 
-            # left, upper, right, lower
-            bbox = (
-                # left
-                left - bbox_padding_x if left > bbox_padding_x else 0,
-                # upper
-                upper - bbox_padding_y if upper > bbox_padding_y else 0,
-                # right
-                right + bbox_padding_x if right < grayscale.width - bbox_padding_x else grayscale.width,
-                # lower
-                lower + bbox_padding_y if lower < grayscale.height - bbox_padding_y else grayscale.height,
-            )
-
-        return bbox
+    def _filter_accessories_by_type(self, accessories_mask: np.ndarray, image: Image, 
+                                   eyeglasses: bool, hat: bool, earrings: bool, 
+                                   other_accessories: bool) -> np.ndarray:
+        """
+        Filter accessories mask to specific types using position and context analysis
+        """
+        if not any([eyeglasses, hat, earrings, other_accessories]):
+            return np.zeros_like(accessories_mask)
+            
+        if other_accessories:
+            # Return full accessories mask if "other_accessories" is enabled
+            return accessories_mask
+            
+        # Get image dimensions
+        height, width = accessories_mask.shape
+        
+        # Create filtered mask
+        filtered_mask = np.zeros_like(accessories_mask)
+        
+        # Find connected components in accessories mask
+        from scipy import ndimage
+        labeled_mask, num_components = ndimage.label(accessories_mask > 0.3)
+        
+        for component_id in range(1, num_components + 1):
+            component_mask = (labeled_mask == component_id)
+            
+            # Get component properties
+            component_coords = np.where(component_mask)
+            if len(component_coords[0]) == 0:
+                continue
+                
+            min_y, max_y = np.min(component_coords[0]), np.max(component_coords[0])
+            min_x, max_x = np.min(component_coords[1]), np.max(component_coords[1])
+            center_y = (min_y + max_y) // 2
+            center_x = (min_x + max_x) // 2
+            
+            # Normalize positions (0-1)
+            norm_center_y = center_y / height
+            norm_center_x = center_x / width
+            norm_height = (max_y - min_y) / height
+            norm_width = (max_x - min_x) / width
+            
+            # Classification logic based on position and size
+            component_area = np.sum(component_mask)
+            
+            # EYEGLASSES: Central face area, horizontal shape, medium size
+            if eyeglasses and (0.25 < norm_center_y < 0.65) and (0.2 < norm_center_x < 0.8):
+                if norm_width > norm_height * 1.2 and 0.02 < component_area / (height * width) < 0.15:
+                    filtered_mask += component_mask.astype(np.float32)
+                    continue
+            
+            # HAT: Top area of image, larger size
+            if hat and norm_center_y < 0.4:
+                if component_area / (height * width) > 0.01:
+                    filtered_mask += component_mask.astype(np.float32)
+                    continue
+                    
+            # EARRINGS: Side areas near face level, small size
+            if earrings and (0.3 < norm_center_y < 0.7):
+                if (norm_center_x < 0.3 or norm_center_x > 0.7) and component_area / (height * width) < 0.01:
+                    filtered_mask += component_mask.astype(np.float32)
+                    continue
+        
+        return np.clip(filtered_mask, 0, 1)
 
     def __get_mask(
             self,
@@ -139,14 +192,17 @@ class APersonMaskGenerator:
             hair_mask: bool,
             body_mask: bool,
             clothes_mask: bool,
+            eyeglasses_mask: bool,
+            hat_mask: bool,
+            earrings_mask: bool,
+            other_accessories_mask: bool,
             confidence: float,
             refine_mask: bool,
     ) -> Image:
         # Retrieve the masks for the segmented image
         media_pipe_image = self.get_mediapipe_image(image=image)
-        if any(
-                [face_mask, background_mask, hair_mask, body_mask, clothes_mask]
-        ):
+        if any([face_mask, background_mask, hair_mask, body_mask, clothes_mask, 
+                eyeglasses_mask, hat_mask, earrings_mask, other_accessories_mask]):
             segmented_masks = segmenter.segment(media_pipe_image)
 
         # https://developers.google.com/mediapipe/solutions/vision/image_segmenter#multiclass-model
@@ -167,6 +223,24 @@ class APersonMaskGenerator:
             masks.append(segmented_masks.confidence_masks[3])
         if clothes_mask:
             masks.append(segmented_masks.confidence_masks[4])
+            
+        # Handle accessories with smart filtering
+        if any([eyeglasses_mask, hat_mask, earrings_mask, other_accessories_mask]):
+            if len(segmented_masks.confidence_masks) > 5:
+                accessories_raw = segmented_masks.confidence_masks[5].numpy_view()
+                filtered_accessories = self._filter_accessories_by_type(
+                    accessories_raw, image, 
+                    eyeglasses_mask, hat_mask, earrings_mask, other_accessories_mask
+                )
+                
+                # Convert filtered accessories back to MediaPipe mask format
+                class FilteredAccessoriesMask:
+                    def __init__(self, array):
+                        self._array = array
+                    def numpy_view(self):
+                        return self._array
+                
+                masks.append(FilteredAccessoriesMask(filtered_accessories))
 
         image_data = media_pipe_image.numpy_view()
         image_shape = image_data.shape
@@ -215,6 +289,10 @@ class APersonMaskGenerator:
                                                    hair_mask=hair_mask,
                                                    body_mask=body_mask,
                                                    clothes_mask=clothes_mask,
+                                                   eyeglasses_mask=eyeglasses_mask,
+                                                   hat_mask=hat_mask,
+                                                   earrings_mask=earrings_mask,
+                                                   other_accessories_mask=other_accessories_mask,
                                                    confidence=confidence,
                                                    refine_mask=False,
                                                    )
@@ -233,6 +311,10 @@ class APersonMaskGenerator:
             hair_mask: bool,
             body_mask: bool,
             clothes_mask: bool,
+            eyeglasses_mask: bool,
+            hat_mask: bool,
+            earrings_mask: bool,
+            other_accessories_mask: bool,
             confidence: float,
             refine_mask: bool,
     ) -> list[Image]:
@@ -273,6 +355,10 @@ class APersonMaskGenerator:
                     hair_mask=hair_mask,
                     body_mask=body_mask,
                     clothes_mask=clothes_mask,
+                    eyeglasses_mask=eyeglasses_mask,
+                    hat_mask=hat_mask,
+                    earrings_mask=earrings_mask,
+                    other_accessories_mask=other_accessories_mask,
                     confidence=confidence,
                     refine_mask=refine_mask,
                 )
@@ -288,6 +374,10 @@ class APersonMaskGenerator:
             hair_mask: bool,
             body_mask: bool,
             clothes_mask: bool,
+            eyeglasses_mask: bool,
+            hat_mask: bool,
+            earrings_mask: bool,
+            other_accessories_mask: bool,
             confidence: float,
             refine_mask: bool,
     ):
@@ -295,13 +385,17 @@ class APersonMaskGenerator:
 
         Args:
             image (torch.Tensor): The image to create the mask for.
-            face_mask (bool): create a mask for the background.
-            background_mask (bool): create a mask for the hair.
-            hair_mask (bool): create a mask for the body .
-            body_mask (bool): create a mask for the face.
+            face_mask (bool): create a mask for the face.
+            background_mask (bool): create a mask for the background.
+            hair_mask (bool): create a mask for the hair.
+            body_mask (bool): create a mask for the body.
             clothes_mask (bool): create a mask for the clothes.
+            eyeglasses_mask (bool): create a mask for eyeglasses.
+            hat_mask (bool): create a mask for hats.
+            earrings_mask (bool): create a mask for earrings.
+            other_accessories_mask (bool): create a mask for other accessories.
             confidence (float): how confident the model is that the detected item is there.
-            break_image_into_tiles ("none" or "auto"): break large images into tiles to improve detection.
+            refine_mask (bool): refine the mask by cropping and re-processing.
 
         Returns:
             torch.Tensor: The segmentation masks.
@@ -314,6 +408,10 @@ class APersonMaskGenerator:
             hair_mask=hair_mask,
             body_mask=body_mask,
             clothes_mask=clothes_mask,
+            eyeglasses_mask=eyeglasses_mask,
+            hat_mask=hat_mask,
+            earrings_mask=earrings_mask,
+            other_accessories_mask=other_accessories_mask,
             confidence=confidence,
             refine_mask=refine_mask,
         )
